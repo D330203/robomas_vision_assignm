@@ -30,24 +30,122 @@ use serde::{Deserialize, Serialize};
 use std::f64::consts::TAU;
 use ui::{Color, Gizmos};
 
-/// Implement latency compensation, plate selection, and future-position aiming.
+/// Predict an intercept from the delayed observation, then check front-face entry.
 pub fn aim(input: &Input, debug: &mut Gizmos) -> Option<Command> {
     let resolved = input.stats.hits + input.stats.misses;
     debug.overlay("Hit rate", format!("{}/{resolved}", input.stats.hits));
 
     let observation = input.observation?;
+    /// 观测年龄 = 现在时间 - 观测时间
+    let age_s = input.now_s - observation.time_s; 
+    if !age_s.is_finite() || age_s < 0.0 {
+        return None;
+    }
     for plate in observation.target.plates(input.size) {
         debug.plate(plate, input.size, Color::Cyan);
     }
 
-    // 1. Find the observation age and account for launch latency.
-    // 2. Select an armor plate before solving its trajectory.
-    // 3. Solve a trajectory with Trajectory::solve.
-    // 4. Aim at the future plate position using age, launch delay, and flight time.
-    // Optional drawings for your solution:
-    // debug.plate(predicted_plate, input.size, Color::Green);
-    // debug.trajectory(trajectory, Color::Orange);
+    let until_launch_s = age_s + physics::LAUNCH_DELAY_S;
+    let target_at_launch = observation.target.at(until_launch_s);
+    /// 确定中心点位置
+    let center_m = [
+        target_at_launch.x_m,
+        target_at_launch.y_m,
+        input.size.plate_center_z_m,
+    ];
+    let offset_m = subtract(center_m, physics::MUZZLE_M);
+    let rough_flight_s = dot(offset_m, offset_m).sqrt() / physics::MUZZLE_SPEED_M_S;
+
+    // Choose once using the predicted facing at the rough arrival time.
+    let rough_plates = observation
+        .target
+        .at(until_launch_s + rough_flight_s)
+        .plates(input.size);
+    let (slot, _) = rough_plates
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, plate)| {
+            let to_muzzle = subtract(physics::MUZZLE_M, plate.center_m);
+            let facing = normal_alignment(plate.outward_normal, to_muzzle)?;
+            (facing > 0.0).then_some((slot, facing))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+
+    let (trajectory, plate) = solve_intercept(
+        observation.target,
+        input.size,
+        slot,
+        until_launch_s,
+        rough_flight_s,
+    )?;
+    ///相对速度 = 目标速度 - 弹丸速度
+    let relative_velocity = subtract(
+        trajectory.velocity(trajectory.flight_time_s),
+        plate.velocity_m_s,
+    );
+    let incidence = -normal_alignment(plate.outward_normal, relative_velocity)?;
+    // Positive means front-face entry; keep a margin against grazing shots.
+    const MIN_INCIDENCE_COS: f64 = 0.25;
+
+    debug.plate(plate, input.size, Color::Green);
+    debug.trajectory(trajectory, Color::Orange);
+    debug.point(
+        "Impact",
+        trajectory.position(trajectory.flight_time_s),
+        Color::Green,
+    );
+    debug.overlay(
+        "Flight",
+        format!("{:.1} ms", 1000.0 * trajectory.flight_time_s),
+    );
+    debug.overlay("Incidence", format!("{incidence:.2}"));
+
+    Some(Command {
+        yaw_rad: trajectory.yaw_rad,
+        pitch_rad: trajectory.pitch_rad,
+        fire: incidence >= MIN_INCIDENCE_COS,
+    })
+}
+
+fn solve_intercept(
+    target: Target,
+    size: Size,
+    slot: usize,
+    until_launch_s: f64,
+    mut flight_s: f64,
+) -> Option<(Trajectory, Plate)> {
+    const TIME_TOLERANCE_S: f64 = 1e-7;
+    const MAX_ITERATIONS: usize = 32;
+
+    for _ in 0..MAX_ITERATIONS {
+        let plate = target.at(until_launch_s + flight_s).plates(size)[slot];
+        let trajectory = Trajectory::solve(plate.center_m)?;
+        let next_flight_s = trajectory.flight_time_s;
+        if (next_flight_s - flight_s).abs() <= TIME_TOLERANCE_S {
+            // Use the solved flight time for both drawing and the incidence check.
+            let impact_plate = target.at(until_launch_s + next_flight_s).plates(size)[slot];
+            return Some((trajectory, impact_plate));
+        }
+        flight_s = next_flight_s;
+    }
     None
+}
+
+fn subtract(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|i| a[i] - b[i])
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a.into_iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn normal_alignment(unit_normal: [f64; 3], direction: [f64; 3]) -> Option<f64> {
+    let length = dot(direction, direction).sqrt();
+    if !length.is_finite() || length <= 0.0 {
+        return None;
+    }
+    let alignment = dot(unit_normal, direction) / length;
+    alignment.is_finite().then_some(alignment)
 }
 
 /// The only simulation data provided to the applicant's controller.

@@ -35,8 +35,6 @@ https://github.com/user-attachments/assets/2a08b028-4c0a-400b-9102-b1cc2989b7e8
 ## 运行
 
 在 `aiming` 目录执行：
-
-```sh
 cargo run --locked
 cargo run --locked -- --config scenarios/stationary.json
 cargo run --locked -- --config scenarios/spinning.json
