@@ -30,7 +30,8 @@ use serde::{Deserialize, Serialize};
 use std::f64::consts::TAU;
 use ui::{Color, Gizmos};
 
-/// Predict an intercept from the delayed observation, then check front-face entry.
+/// 调用核心功能函数aim（）求解弹道，input只读输入，mutGizmos允许函数添加调试信息
+///返回值为Option<Command>，如果没有观测数据则返回None
 pub fn aim(input: &Input, debug: &mut Gizmos) -> Option<Command> {
     let resolved = input.stats.hits + input.stats.misses;
     debug.overlay("Hit rate", format!("{}/{resolved}", input.stats.hits));
@@ -56,7 +57,7 @@ pub fn aim(input: &Input, debug: &mut Gizmos) -> Option<Command> {
     let offset_m = subtract(center_m, physics::MUZZLE_M);
     let rough_flight_s = dot(offset_m, offset_m).sqrt() / physics::MUZZLE_SPEED_M_S;
 
-    // Choose once using the predicted facing at the rough arrival time.
+    // 计算目标板的相对速度和入射角度
     let rough_plates = observation
         .target
         .at(until_launch_s + rough_flight_s)
@@ -84,9 +85,12 @@ pub fn aim(input: &Input, debug: &mut Gizmos) -> Option<Command> {
         plate.velocity_m_s,
     );
     let incidence = -normal_alignment(plate.outward_normal, relative_velocity)?;
-    // Positive means front-face entry; keep a margin against grazing shots.
+    // 入射评分：先设定常量：子弹抛物运动向量减去目标板的速度向量，得到相对速度向量，
+    // 然后计算相对速度向量与板法线的夹角余弦值（大于零）
+    // 余弦值越大，说明子弹入射角度越接近板法线方向，命中概率越高
+    // 余弦最小值设为0.25，低于该值说明夹角过大，系统不开火
     const MIN_INCIDENCE_COS: f64 = 0.25;
-
+    //设定模拟渲染颜色
     debug.plate(plate, input.size, Color::Green);
     debug.trajectory(trajectory, Color::Orange);
     debug.point(
@@ -114,15 +118,20 @@ fn solve_intercept(
     until_launch_s: f64,
     mut flight_s: f64,
 ) -> Option<(Trajectory, Plate)> {
+//瞄准的装甲板编号只在单次迭代固定，重新迭代时，目标板可以重新选择
     const TIME_TOLERANCE_S: f64 = 1e-7;
     const MAX_ITERATIONS: usize = 32;
-
+// 迭代求解到目标板的飞行时间，122行设定最大迭代次数32次，121行设定两次迭代误差允许范围为1e-7秒
+// 由于开始迭代时，估算的飞行时间没有考虑目标版移动的因素，故需要每次加入目标版在该段时间内移动的距离
+// 重新计算飞行时间，直到两次计算的飞行时间差小于误差允许范围
+// 考虑到某些情况（例如目标版加速远离，迭代无法收敛）设定最大迭代次数，避免陷入死循环，节省计算资源。
     for _ in 0..MAX_ITERATIONS {
+    /// 迭代起点，总时间 = 发射延迟 + roughflight（飞行估算）   
         let plate = target.at(until_launch_s + flight_s).plates(size)[slot];
         let trajectory = Trajectory::solve(plate.center_m)?;
         let next_flight_s = trajectory.flight_time_s;
         if (next_flight_s - flight_s).abs() <= TIME_TOLERANCE_S {
-            // Use the solved flight time for both drawing and the incidence check.
+            // 求解出的飞行时间同时用于检测击中和模拟绘制
             let impact_plate = target.at(until_launch_s + next_flight_s).plates(size)[slot];
             return Some((trajectory, impact_plate));
         }
@@ -148,6 +157,7 @@ fn normal_alignment(unit_normal: [f64; 3], direction: [f64; 3]) -> Option<f64> {
     alignment.is_finite().then_some(alignment)
 }
 
+/// 仿真器执行，检测输入
 /// The only simulation data provided to the applicant's controller.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Input {
@@ -160,6 +170,7 @@ pub struct Input {
     pub stats: Stats,
 }
 
+/// 初始化幅角
 /// World yaw, upward pitch, and a request to fire at the fixed maximum rate.
 /// Angles are latched when a shot is accepted, then applied after `physics::LAUNCH_DELAY_S`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -169,6 +180,7 @@ pub struct Command {
     pub fire: bool,
 }
 
+/// 模拟只考虑重力
 /// A gravity-only projectile path. Flight time starts at launch, excluding all delays.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Trajectory {
@@ -178,6 +190,10 @@ pub struct Trajectory {
 }
 
 impl Trajectory {
+    /// 弹道求解，包含在迭代步骤中
+    /// 根据目标距离（向量）反推飞行时间，解二次方程求得较小的飞行时间t（即较平的弹道）
+    /// 用该飞行时间推算俯仰角，计算弹道
+    /// 若求解出的飞行时间不合理（负数，复数或大于两秒）则返回None，不开火
     /// Solve the low arc to a fixed world point at the fixed muzzle speed.
     /// Returns `None` for an unreachable point, nonfinite input, zero flight time, or timeout.
     /// Predict the moving target separately; this method does not compensate for delays.
@@ -219,7 +235,7 @@ impl Trajectory {
                 }
         })
     }
-
+    /// 相对于地面速度
     /// World velocity `elapsed_s` after launch, before subtracting the armor's velocity.
     pub fn velocity(self, elapsed_s: f64) -> [f64; 3] {
         let horizontal = physics::MUZZLE_SPEED_M_S * self.pitch_rad.cos();
@@ -291,6 +307,7 @@ pub struct Size {
     pub plate_center_z_m: f64,
 }
 
+/// 
 /// Ground-truth plate state; plate indices remain attached to the target as it turns.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Plate {
