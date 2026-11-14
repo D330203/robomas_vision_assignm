@@ -126,7 +126,7 @@ fn solve_intercept(
 // 重新计算飞行时间，直到两次计算的飞行时间差小于误差允许范围
 // 考虑到某些情况（例如目标版加速远离，迭代无法收敛）设定最大迭代次数，避免陷入死循环，节省计算资源。
     for _ in 0..MAX_ITERATIONS {
-    /// 迭代起点，总时间 = 发射延迟 + roughflight（飞行估算）   
+    // 迭代起点，总时间 = 发射延迟 + roughflight（飞行估算）   
         let plate = target.at(until_launch_s + flight_s).plates(size)[slot];
         let trajectory = Trajectory::solve(plate.center_m)?;
         let next_flight_s = trajectory.flight_time_s;
